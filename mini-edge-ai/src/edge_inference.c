@@ -3,6 +3,7 @@
 #include <string.h>
 #include <stdio.h>
 #include <float.h>
+#include <math.h>
 
 struct InferCtx {
     InferConfig config;
@@ -65,12 +66,6 @@ int infer_load_model(InferCtx* ctx) {
         }
     }
     return 0;
-}
-
-static float mock_softmax_sum(const float* x, int n) {
-    float s = 0.0f;
-    for (int i = 0; i < n; ++i) s += x[i];
-    return s;
 }
 
 int infer_run(InferCtx* ctx, const void* input, size_t input_bytes) {
@@ -213,7 +208,7 @@ int postproc_softmax_f32(const float* logits, float* probs, int n) {
     for (int i = 1; i < n; ++i) if (logits[i] > m) m = logits[i];
     float sum = 0.0f;
     for (int i = 0; i < n; ++i) {
-        probs[i] = (float)(expf ? expf(logits[i] - m) : 1.0f);
+        probs[i] = expf(logits[i] - m);
         sum += probs[i];
     }
     if (sum > 1e-12f) for (int i = 0; i < n; ++i) probs[i] /= sum;
@@ -264,5 +259,344 @@ int postproc_sigmoid_f32(const float* x, float* y, int n) {
     for (int i = 0; i < n; ++i) {
         y[i] = 1.0f / (1.0f + expf(-(x[i])));
     }
+    return 0;
+}
+
+/* ================================================================
+ *  L5: Kalman Filter 1D (Kalman 1960)
+ *  "A New Approach to Linear Filtering and Prediction Problems"
+ *  Optimal state estimation for linear systems with Gaussian noise.
+ *  Predict:  x = x + u,   P = P + Q
+ *  Update:   K = P / (P + R),  x = x + K*(z - x),  P = (1-K)*P
+ * ================================================================ */
+void kalman1d_init(KalmanFilter1D* kf, float init_x, float init_p,
+                   float process_q, float measure_r) {
+    if (!kf) return;
+    kf->x = init_x;
+    kf->p = init_p;
+    kf->q = process_q;
+    kf->r = measure_r;
+    kf->k = 0.0f;
+}
+
+float kalman1d_predict(KalmanFilter1D* kf, float control) {
+    if (!kf) return 0.0f;
+    kf->x += control;
+    kf->p += kf->q;
+    return kf->x;
+}
+
+float kalman1d_update(KalmanFilter1D* kf, float measurement) {
+    if (!kf) return 0.0f;
+    kf->k = kf->p / (kf->p + kf->r);
+    kf->x = kf->x + kf->k * (measurement - kf->x);
+    kf->p = (1.0f - kf->k) * kf->p;
+    return kf->x;
+}
+
+/* ================================================================
+ *  L5: Welford's Online Algorithm (Welford 1962 / Knuth TAOCP Vol.2)
+ *  Numerically stable single-pass computation of mean and variance.
+ *  M1 = x1,  Mk = M_{k-1} + (xk - M_{k-1})/k
+ *  S1 = 0,   Sk = S_{k-1} + (xk - M_{k-1})*(xk - Mk)
+ *  variance = S_n / (n - 1),  population var = S_n / n
+ * ================================================================ */
+void online_stats_init(OnlineStats* s) {
+    if (!s) return;
+    s->count   = 0;
+    s->mean    = 0.0f;
+    s->m2      = 0.0f;
+    s->min_val = 1e30f;
+    s->max_val = -1e30f;
+}
+
+void online_stats_push(OnlineStats* s, float value) {
+    if (!s) return;
+    s->count++;
+    float delta = value - s->mean;
+    s->mean += delta / (float)s->count;
+    float delta2 = value - s->mean;
+    s->m2 += delta * delta2;
+    if (value < s->min_val) s->min_val = value;
+    if (value > s->max_val) s->max_val = value;
+}
+
+float online_stats_mean(const OnlineStats* s) {
+    return s ? s->mean : 0.0f;
+}
+
+float online_stats_variance(const OnlineStats* s) {
+    if (!s || s->count < 2) return 0.0f;
+    return s->m2 / (float)(s->count - 1);
+}
+
+float online_stats_stddev(const OnlineStats* s) {
+    if (!s || s->count < 2) return 0.0f;
+    return sqrtf(s->m2 / (float)(s->count - 1));
+}
+
+/* ================================================================
+ *  L5: Streaming Top-K using Min-Heap
+ *  Maintains the k largest elements seen so far in a min-heap.
+ *  Time: O(log k) per push, O(k log k) for final sort.
+ *  Space: O(k)
+ * ================================================================ */
+void topk_init(TopKHeap* tk, int k) {
+    if (!tk) return;
+    tk->k = k < TOPK_MAX_K ? k : TOPK_MAX_K;
+    tk->size = 0;
+}
+
+static void topk_heap_sift_down(TopKHeap* tk, int i) {
+    int smallest = i;
+    int l = 2 * i + 1, r = 2 * i + 2;
+    if (l < tk->size && tk->scores[l] < tk->scores[smallest]) smallest = l;
+    if (r < tk->size && tk->scores[r] < tk->scores[smallest]) smallest = r;
+    if (smallest != i) {
+        float ts = tk->scores[i]; tk->scores[i] = tk->scores[smallest]; tk->scores[smallest] = ts;
+        int ti = tk->indices[i]; tk->indices[i] = tk->indices[smallest]; tk->indices[smallest] = ti;
+        topk_heap_sift_down(tk, smallest);
+    }
+}
+
+void topk_push(TopKHeap* tk, float score, int idx) {
+    if (!tk || tk->k <= 0) return;
+    if (tk->size < tk->k) {
+        tk->scores[tk->size] = score;
+        tk->indices[tk->size] = idx;
+        int i = tk->size++;
+        while (i > 0 && tk->scores[(i - 1) / 2] > tk->scores[i]) {
+            float ts = tk->scores[i]; tk->scores[i] = tk->scores[(i-1)/2]; tk->scores[(i-1)/2] = ts;
+            int ti = tk->indices[i]; tk->indices[i] = tk->indices[(i-1)/2]; tk->indices[(i-1)/2] = ti;
+            i = (i - 1) / 2;
+        }
+    } else if (score > tk->scores[0]) {
+        tk->scores[0] = score;
+        tk->indices[0] = idx;
+        topk_heap_sift_down(tk, 0);
+    }
+}
+
+int topk_get_sorted(TopKHeap* tk, float* scores, int* indices) {
+    if (!tk) return 0;
+    int orig_size = tk->size;
+    for (int i = 0; i < tk->size; ++i) {
+        scores[i] = tk->scores[i];
+        if (indices) indices[i] = tk->indices[i];
+    }
+    for (int i = 0; i < tk->size - 1; ++i) {
+        for (int j = i + 1; j < tk->size; ++j) {
+            if (scores[j] > scores[i]) {
+                float ts = scores[i]; scores[i] = scores[j]; scores[j] = ts;
+                if (indices) { int ti = indices[i]; indices[i] = indices[j]; indices[j] = ti; }
+            }
+        }
+    }
+    return orig_size;
+}
+
+/* ================================================================
+ *  L5: Temperature Scaling (Guo et al. 2017)
+ *  "On Calibration of Modern Neural Networks", ICML 2017.
+ *  p_i = exp(z_i / T) / sum_j exp(z_j / T)
+ *  Single scalar T > 0; T=1 leaves logits unchanged.
+ *  Optimal T minimizes NLL on validation set.
+ * ================================================================ */
+float temperature_scale_logits(float* logits, int n, float temperature) {
+    if (!logits || n <= 0) return 0.0f;
+    float t = temperature > 0.0f ? temperature : 1.0f;
+    float m = logits[0];
+    for (int i = 1; i < n; ++i) if (logits[i] > m) m = logits[i];
+    float sum = 0.0f;
+    for (int i = 0; i < n; ++i) {
+        logits[i] = expf((logits[i] - m) / t);
+        sum += logits[i];
+    }
+    for (int i = 0; i < n; ++i) logits[i] /= sum;
+    return sum;
+}
+
+int temperature_scale_find_optimal(const float* logits, const int* labels,
+                                    int n_samples, int n_classes,
+                                    float* temp_out, int max_iter) {
+    if (!logits || !labels || n_samples <= 0 || n_classes <= 1 || !temp_out)
+        return -1;
+    float best_t = 1.0f, best_nll = 1e30f;
+    for (int iter = 0; iter < max_iter; ++iter) {
+        float t = 0.1f + (float)iter * 4.9f / (float)(max_iter > 1 ? max_iter - 1 : 1);
+        float nll = 0.0f;
+        for (int s = 0; s < n_samples; ++s) {
+            const float* row = logits + s * n_classes;
+            float m = row[0];
+            for (int i = 1; i < n_classes; ++i) if (row[i] > m) m = row[i];
+            float sum = 0.0f;
+            for (int i = 0; i < n_classes; ++i) sum += expf((row[i] - m) / t);
+            int lb = labels[s];
+            float prob = expf((row[lb] - m) / t) / sum;
+            nll -= logf(prob > 1e-12f ? prob : 1e-12f);
+        }
+        if (nll < best_nll) { best_nll = nll; best_t = t; }
+    }
+    *temp_out = best_t;
+    return 0;
+}
+
+/* ================================================================
+ *  L4: Mahalanobis Distance (Mahalanobis 1936)
+ *  D^2(x) = (x - μ)^T Σ^{-1} (x - μ)
+ *  Under multivariate normality, D^2 ~ χ²(dim).
+ *  Anomaly threshold from chi-square critical values.
+ * ================================================================ */
+MahalanobisCtx* mahalanobis_create(int dim) {
+    if (dim <= 0) return NULL;
+    MahalanobisCtx* ctx = (MahalanobisCtx*)calloc(1, sizeof(MahalanobisCtx));
+    if (!ctx) return NULL;
+    ctx->dim = dim;
+    ctx->mean = (float*)calloc((size_t)dim, sizeof(float));
+    ctx->inv_cov = (float*)calloc((size_t)dim * dim, sizeof(float));
+    if (!ctx->mean || !ctx->inv_cov) {
+        free(ctx->mean); free(ctx->inv_cov); free(ctx); return NULL;
+    }
+    for (int i = 0; i < dim; ++i) ctx->inv_cov[i * dim + i] = 1.0f;
+    return ctx;
+}
+
+void mahalanobis_destroy(MahalanobisCtx* ctx) {
+    if (!ctx) return;
+    free(ctx->mean);
+    free(ctx->inv_cov);
+    free(ctx);
+}
+
+int mahalanobis_fit(MahalanobisCtx* ctx, const float* data, int n_samples) {
+    if (!ctx || !data || n_samples <= 0) return -1;
+    int d = ctx->dim;
+    memset(ctx->mean, 0, (size_t)d * sizeof(float));
+    for (int s = 0; s < n_samples; ++s)
+        for (int i = 0; i < d; ++i)
+            ctx->mean[i] += data[s * d + i];
+    for (int i = 0; i < d; ++i) ctx->mean[i] /= (float)n_samples;
+    /* Compute covariance Σ */
+    float* cov = (float*)calloc((size_t)d * d, sizeof(float));
+    if (!cov) return -1;
+    for (int s = 0; s < n_samples; ++s) {
+        for (int i = 0; i < d; ++i) {
+            float di = data[s * d + i] - ctx->mean[i];
+            for (int j = 0; j < d; ++j)
+                cov[i * d + j] += di * (data[s * d + j] - ctx->mean[j]);
+        }
+    }
+    float denom = n_samples > 1 ? (float)(n_samples - 1) : 1.0f;
+    for (int i = 0; i < d * d; ++i) cov[i] /= denom;
+    /* Invert using Cholesky with diagonal regularization */
+    for (int i = 0; i < d; ++i) cov[i * d + i] += 1e-6f;
+    for (int i = 0; i < d; ++i) {
+        for (int j = 0; j < d; ++j) {
+            float sum = cov[i * d + j];
+            for (int k = 0; k < i; ++k)
+                sum -= ctx->inv_cov[i * d + k] * ctx->inv_cov[k * d + j];
+            if (i == j) {
+                if (sum <= 0.0f) { free(cov); return -1; }
+                ctx->inv_cov[i * d + i] = sqrtf(sum);
+            } else {
+                ctx->inv_cov[i * d + j] = sum / ctx->inv_cov[i * d + i];
+            }
+        }
+    }
+    /* Copy lower triangular and compute inverse by solving LL^T * inv_cov = I */
+    float* L = (float*)calloc((size_t)d * d, sizeof(float));
+    if (!L) { free(cov); return -1; }
+    memcpy(L, ctx->inv_cov, (size_t)d * d * sizeof(float));
+    memset(ctx->inv_cov, 0, (size_t)d * d * sizeof(float));
+    for (int i = 0; i < d; ++i) ctx->inv_cov[i * d + i] = 1.0f;
+    for (int col = 0; col < d; ++col) {
+        /* Forward substitution: L * y = e_col */
+        for (int i = 0; i < d; ++i) {
+            float sum = (i == col) ? 1.0f : 0.0f;
+            for (int k = 0; k < i; ++k) sum -= L[i * d + k] * ctx->inv_cov[k * d + col];
+            ctx->inv_cov[i * d + col] = sum / L[i * d + i];
+        }
+        /* Back substitution: L^T * x = y */
+        for (int i = d - 1; i >= 0; --i) {
+            float sum = ctx->inv_cov[i * d + col];
+            for (int k = i + 1; k < d; ++k) sum -= L[k * d + i] * ctx->inv_cov[k * d + col];
+            ctx->inv_cov[i * d + col] = sum / L[i * d + i];
+        }
+    }
+    free(L);
+    free(cov);
+    ctx->n_samples = n_samples;
+    return 0;
+}
+
+float mahalanobis_distance(const MahalanobisCtx* ctx, const float* sample) {
+    if (!ctx || !sample) return 0.0f;
+    int d = ctx->dim;
+    float* diff = (float*)malloc((size_t)d * sizeof(float));
+    if (!diff) return 0.0f;
+    for (int i = 0; i < d; ++i) diff[i] = sample[i] - ctx->mean[i];
+    float dist2 = 0.0f;
+    for (int i = 0; i < d; ++i)
+        for (int j = 0; j < d; ++j)
+            dist2 += diff[i] * ctx->inv_cov[j * d + i] * diff[j];  /* j*d+i: transposed access for symmetry */
+    free(diff);
+    return sqrtf(dist2 > 0.0f ? dist2 : 0.0f);
+}
+
+int mahalanobis_is_anomaly(const MahalanobisCtx* ctx, const float* sample,
+                            float threshold) {
+    float d = mahalanobis_distance(ctx, sample);
+    return d > threshold ? 1 : 0;
+}
+
+/* ================================================================
+ *  L4: Pearson's Chi-Squared Goodness-of-Fit Test (Pearson 1900)
+ *  χ² = Σ (O_i - E_i)² / E_i, where E_i = n_total * p_i
+ *  Tests whether observed frequencies differ from expected distribution.
+ *  Degrees of freedom = n_bins - 1.
+ * ================================================================ */
+float chi_square_test(const int* observed, const float* expected_prob,
+                      int n_bins, int n_total) {
+    if (!observed || !expected_prob || n_bins <= 0 || n_total <= 0)
+        return 0.0f;
+    float chi2 = 0.0f;
+    for (int i = 0; i < n_bins; ++i) {
+        float expected = expected_prob[i] * (float)n_total;
+        if (expected < 1e-9f) continue;
+        float diff = (float)observed[i] - expected;
+        chi2 += diff * diff / expected;
+    }
+    return chi2;
+}
+
+/* ================================================================
+ *  L5: Ensemble Prediction — Weighted Average of Model Logits
+ *  Given N models each producing logit vector of size C,
+ *  compute weighted average probabilities via softmax of
+ *  averaged logits.  Weights should sum to 1.
+ *  Theorem: Under MSE loss, equal weighting minimizes
+ *  expected error (Bates & Granger 1969, "Combination of Forecasts").
+ * ================================================================ */
+int ensemble_predict_classification(float** model_logits, int n_models,
+                                     int n_classes, float* weights,
+                                     float* ensemble_probs) {
+    if (!model_logits || !ensemble_probs || n_models <= 0 || n_classes <= 0)
+        return -1;
+    float* avg_logits = (float*)calloc((size_t)n_classes, sizeof(float));
+    if (!avg_logits) return -1;
+    for (int m = 0; m < n_models; ++m) {
+        float w = weights ? weights[m] : 1.0f / (float)n_models;
+        for (int c = 0; c < n_classes; ++c)
+            avg_logits[c] += model_logits[m][c] * w;
+    }
+    float m = avg_logits[0];
+    for (int i = 1; i < n_classes; ++i) if (avg_logits[i] > m) m = avg_logits[i];
+    float sum = 0.0f;
+    for (int i = 0; i < n_classes; ++i) {
+        ensemble_probs[i] = expf(avg_logits[i] - m);
+        sum += ensemble_probs[i];
+    }
+    for (int i = 0; i < n_classes; ++i) ensemble_probs[i] /= sum;
+    free(avg_logits);
     return 0;
 }

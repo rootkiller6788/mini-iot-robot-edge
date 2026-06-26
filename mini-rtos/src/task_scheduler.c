@@ -1,10 +1,7 @@
 #include "task_scheduler.h"
 #include "memory_heap.h"
+#include "portable.h"
 #include <string.h>
-
-#define PORT_PENDSV_TRIGGER()  (*(volatile uint32_t *)0xE000ED04 = (1U << 28))
-#define PORT_FAULT_MASK()      __asm volatile("cpsid f" ::: "memory")
-#define PORT_UNFAULT_MASK()    __asm volatile("cpsie f" ::: "memory")
 
 static tcb_t  *task_list[TASK_PRIORITY_MAX] = {NULL};
 static tcb_t  *current_task = NULL;
@@ -27,24 +24,25 @@ static void idle_entry(void *param)
 {
     (void)param;
     while (1) {
-        __asm volatile("wfi");
+        PORT_WFI();
     }
 }
 
 static void task_stack_init(tcb_t *task)
 {
-    uint32_t *sp = (uint32_t *)((uint32_t)((uint8_t *)task->stack_start + task->stack_size));
+    uintptr_t sp_top = (uintptr_t)((uint8_t *)task->stack_start + task->stack_size);
+    uint32_t *sp = (uint32_t *)sp_top;
     uint32_t i;
     for (i = 0; i < task->stack_size / 4; i++) {
         task->stack_start[i] = TASK_STACK_WATERMARK;
     }
     sp -= 16;
-    sp[14] = (uint32_t)task->entry;
+    sp[14] = (uint32_t)(uintptr_t)task->entry;
     sp[15] = 0x01000000U;
-    sp[13] = (uint32_t)sp + 64;
-    sp[12] = (uint32_t)task->param;
+    sp[13] = (uint32_t)((uintptr_t)sp + 64);
+    sp[12] = (uint32_t)(uintptr_t)task->param;
     sp[8]  = 0xFFFFFFFDU;
-    sp[9]  = (uint32_t)task_delete;
+    sp[9]  = (uint32_t)(uintptr_t)task_delete;
     task->sp = sp;
 }
 
@@ -73,12 +71,12 @@ tcb_t *task_create(task_entry_t entry, const char *name, uint32_t stack_size,
     stack_size = (stack_size + 7) & ~7U;
     task = (tcb_t *)malloc_rtos(sizeof(tcb_t));
     if (!task) return NULL;
+    memset(task, 0, sizeof(tcb_t));
     task->stack_start = (uint32_t *)malloc_rtos(stack_size);
     if (!task->stack_start) {
         free_rtos(task);
         return NULL;
     }
-    memset(task, 0, sizeof(tcb_t));
     task->stack_size = stack_size;
     task->priority = priority;
     task->base_priority = priority;
@@ -183,7 +181,7 @@ void task_resume(tcb_t *task)
                 head->prev->next = task;
                 head->prev = task;
             }
-            if (task->priority > current_task->priority) {
+            if (current_task && task->priority > current_task->priority) {
                 context_switch_pending = 1;
             }
         }
@@ -383,3 +381,137 @@ void task_list_debug(void)
         } while (task != head);
     }
 }
+
+/*
+ * L5: Rate-Monotonic priority assignment (Liu & Layland 1973).
+ *
+ * Given an array of task periods, assigns priorities such that
+ * shorter period = higher priority. This is the optimal fixed-priority
+ * assignment for independent periodic tasks with implicit deadlines.
+ *
+ * The schedulability test is performed separately via RMA test.
+ *
+ * L4 Theorem: Among all fixed-priority schemes, RM is optimal in the
+ * sense that if any fixed-priority scheme can schedule a task set,
+ * RM can also schedule it (Lehoczky et al., 1989).
+ */
+void scheduler_assign_rm_priorities(tcb_t **tasks, uint32_t *periods,
+                                     uint32_t count)
+{
+    uint32_t i, j;
+    if (!tasks || !periods || count < 2) return;
+    /* Simple insertion sort by period (ascending -> higher priority) */
+    for (i = 0; i < count; i++) {
+        for (j = i + 1; j < count; j++) {
+            if (periods[i] > periods[j]) {
+                uint32_t tmp_p = periods[i];
+                tcb_t *tmp_t = tasks[i];
+                periods[i] = periods[j];
+                tasks[i] = tasks[j];
+                periods[j] = tmp_p;
+                tasks[j] = tmp_t;
+            }
+        }
+    }
+    /* Assign priorities: TASK_PRIORITY_HIGHEST for shortest period */
+    for (i = 0; i < count && i < TASK_PRIORITY_HIGHEST; i++) {
+        tasks[i]->priority = TASK_PRIORITY_HIGHEST - i;
+        tasks[i]->base_priority = tasks[i]->priority;
+    }
+}
+
+/*
+ * L3: System load factor computation.
+ *
+ * Load = total_runtime / total_ticks (ratio of non-idle time).
+ * Used for capacity planning and overload detection.
+ *
+ * Returns load in permil (0-1000). 1000 = 100% CPU, 0 = fully idle.
+ */
+uint32_t scheduler_get_load_permil(void)
+{
+    uint32_t total = task_get_tick_count();
+    uint32_t i, busy_ticks = 0;
+    if (total == 0) return 0;
+    for (i = 0; i < TASK_PRIORITY_MAX; i++) {
+        tcb_t *head = task_list[i];
+        if (!head) continue;
+        tcb_t *task = head;
+        do {
+            busy_ticks += task->runtime_ticks;
+            task = task->next;
+        } while (task != head);
+    }
+    /* Clamp to 1000 permil */
+    if (busy_ticks >= total) return 1000;
+    return (busy_ticks * 1000U) / total;
+}
+
+/*
+ * L6: EDF (Earliest Deadline First) ready-queue insertion.
+ *
+ * L5 Algorithm: EDF is a dynamic priority scheduling algorithm where
+ * the task with the earliest absolute deadline has the highest priority.
+ * Unlike RM, EDF can achieve 100% CPU utilization (U <= 1.0).
+ *
+ * L4 Theorem (Dertouzos, 1974): EDF is optimal among all preemptive
+ * scheduling algorithms on uniprocessors — if any algorithm can
+ * schedule a task set, EDF can too.
+ *
+ * This function inserts a task into a deadline-ordered list.
+ */
+void scheduler_edf_list_insert(tcb_t **edf_list, tcb_t *task,
+                                uint32_t deadline)
+{
+    tcb_t *prev = NULL, *curr;
+    if (!edf_list || !task) return;
+    task->ticks_remaining = deadline; /* reuse field for EDF deadline */
+    task->next = NULL;
+    curr = *edf_list;
+    /* Insert sorted by absolute deadline (earliest first) */
+    while (curr && curr->ticks_remaining <= deadline) {
+        prev = curr;
+        curr = curr->next;
+    }
+    if (!prev) {
+        task->next = *edf_list;
+        *edf_list = task;
+    } else {
+        task->next = prev->next;
+        prev->next = task;
+    }
+}
+
+/*
+ * L3: Current task runtime in ticks.
+ * Returns accumulated runtime of the currently executing task.
+ */
+uint32_t task_get_runtime_ticks(void)
+{
+    tcb_t *cur = task_get_current();
+    return cur ? cur->runtime_ticks : 0;
+}
+
+/*
+ * L3: Port function stubs for host (non-ARM) compilation.
+ * On ARM targets, these are provided by port.c with actual assembly.
+ */
+#ifndef __arm__
+
+void port_start_first_task(void)
+{
+    /* Host stub: just set tick and loop the scheduler */
+    tick_count = 1;
+}
+
+void port_save_context(void)
+{
+    /* Host stub: no actual context to save */
+}
+
+void port_restore_context(void)
+{
+    /* Host stub: no actual context to restore */
+}
+
+#endif /* !__arm__ */

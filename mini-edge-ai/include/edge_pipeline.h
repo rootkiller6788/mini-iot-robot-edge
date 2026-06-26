@@ -119,6 +119,108 @@ int            fed_learn_aggregate(const float* local_weights, int num_clients,
                                    const float** client_weights, int n_weights,
                                    float* global_weights);
 
+/* ── L5: Priority Queue Scheduler for Pipeline Tasks ── */
+#define MAX_PRIORITY_TASKS 64
+typedef struct {
+    int      task_id;
+    int      priority;    /* lower = higher priority (min-heap) */
+    uint64_t deadline_ms;
+    int      (*fn)(void*);
+    void*    arg;
+} PriorityTask;
+
+typedef struct {
+    PriorityTask tasks[MAX_PRIORITY_TASKS];
+    int          size;
+} PriorityQueue;
+
+void          pq_init(PriorityQueue* pq);
+int           pq_push(PriorityQueue* pq, int priority, uint64_t deadline,
+                      int (*fn)(void*), void* arg);
+int           pq_pop(PriorityQueue* pq, PriorityTask* out);
+int           pq_peek_deadline(const PriorityQueue* pq, uint64_t now,
+                               PriorityTask* overdue, int max_overdue);
+
+/* ── L3: Ring Buffer (Circular Buffer) for Streaming Data ── */
+#define RINGBUF_CAPACITY 4096
+typedef struct {
+    uint8_t  buf[RINGBUF_CAPACITY];
+    int      head;       /* write position */
+    int      tail;       /* read position */
+    int      count;
+} RingBuffer;
+
+void          ringbuf_init(RingBuffer* rb);
+int           ringbuf_write(RingBuffer* rb, const void* data, int bytes);
+int           ringbuf_read(RingBuffer* rb, void* out, int bytes);
+int           ringbuf_available(const RingBuffer* rb);
+int           ringbuf_free_space(const RingBuffer* rb);
+
+/* ── L3: Watchdog Timer — fault detection for critical pipelines ── */
+typedef struct {
+    uint64_t timeout_ms;
+    uint64_t last_kick_ms;
+    int      expired;
+    int      enabled;
+} Watchdog;
+
+void          watchdog_init(Watchdog* wd, uint64_t timeout_ms);
+void          watchdog_kick(Watchdog* wd, uint64_t now_ms);
+int           watchdog_is_expired(const Watchdog* wd, uint64_t now_ms);
+
+/* ── L5: Complementary Filter (Sensor Fusion) ──
+   Combines high-freq gyro and low-freq accelerometer data.
+   θ = α*(θ + ω*dt) + (1-α)*θ_accel
+   α ∈ [0,1]; α close to 1 trusts gyro more. ── */
+typedef struct {
+    float angle;       /* fused angle estimate */
+    float alpha;       /* filter coefficient */
+    float dt;          /* time step */
+} CompFilter;
+
+void          comp_filter_init(CompFilter* cf, float alpha, float dt);
+float         comp_filter_update(CompFilter* cf, float gyro_rate,
+                                 float accel_angle);
+
+/* ── L4: SHA-256 Hash (FIPS 180-4) for OTA Update Integrity ── */
+#define SHA256_DIGEST_SIZE  32
+#define SHA256_BLOCK_SIZE   64
+
+typedef struct {
+    uint32_t state[8];
+    uint64_t bitlen;
+    uint8_t  block[SHA256_BLOCK_SIZE];
+    int      block_idx;
+    uint8_t  digest[SHA256_DIGEST_SIZE];
+    int      finalized;
+} SHA256Ctx;
+
+void          sha256_init(SHA256Ctx* ctx);
+void          sha256_update(SHA256Ctx* ctx, const uint8_t* data, size_t len);
+void          sha256_final(SHA256Ctx* ctx);
+int           sha256_verify(const uint8_t* data, size_t len,
+                            const uint8_t* expected_hash);
+
+/* ── L8: Energy-Aware Task Scheduling ── */
+typedef struct {
+    float    energy_per_op;     /* μJ per operation */
+    float    idle_power_mw;     /* idle power in milliwatts */
+    float    peak_power_mw;     /* peak power in milliwatts */
+    uint64_t last_active_ms;
+    uint64_t total_idle_ms;
+    float    total_energy_mj;   /* total energy in millijoules */
+} EnergyTracker;
+
+void          energy_tracker_init(EnergyTracker* et, float e_per_op,
+                                  float idle_mw, float peak_mw);
+void          energy_tracker_record_active(EnergyTracker* et, uint64_t now_ms,
+                                            int num_ops);
+void          energy_tracker_record_idle(EnergyTracker* et, uint64_t now_ms);
+float         energy_tracker_get_total_mj(const EnergyTracker* et);
+int           energy_aware_should_defer(const EnergyTracker* et,
+                                         uint64_t now_ms,
+                                         float energy_budget_mj);
+
 #ifdef __cplusplus
 }
 #endif

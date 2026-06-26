@@ -199,3 +199,75 @@ void trustzone_isolate_partition(TrustZoneCore *tz, int partition_id) {
     tz->partition_count++;
     tz->tfm_state = TF_M_ISOLATED;
 }
+
+/* L3: Memory Protection Unit (MPU) configuration for TrustZone
+ * ARMv8-M MPU: isolates secure partitions from each other */
+void trustzone_mpu_configure_region(TrustZoneCore *tz, int region_id,
+                                     uint32_t base, uint32_t limit,
+                                     bool is_privileged_rdonly) {
+    if (region_id < 0 || region_id >= 8) return;
+    if (tz->tfm_state != TF_M_RUNNING && tz->tfm_state != TF_M_ISOLATED) return;
+    tz->idau.regions[region_id % IDAU_REGION_COUNT].base_addr = base;
+    tz->idau.regions[region_id % IDAU_REGION_COUNT].size = limit - base;
+    tz->idau.regions[region_id % IDAU_REGION_COUNT].is_secure = true;
+    if (region_id >= tz->idau.region_count)
+        tz->idau.region_count = region_id + 1;
+    (void)is_privileged_rdonly;
+}
+
+/* L3: Stack protection for secure world
+ * ARMv8-M Security Extension: MSPLIM_S / PSPLIM_S stack limit registers */
+bool trustzone_check_stack_overflow(TrustZoneCore *tz, uint32_t stack_ptr,
+                                     uint32_t stack_limit) {
+    if (tz->current_world != SEC_WORLD_SECURE) return false;
+    return stack_ptr < stack_limit;
+}
+
+/* L8: Secure fault handler for TrustZone security violations
+ * Handles: SecureFault, MemManage, BusFault in secure context */
+void trustzone_handle_secure_fault(TrustZoneCore *tz, uint32_t fault_addr,
+                                    int fault_type) {
+    if (tz->tfm_state == TF_M_RUNNING) {
+        tz->tfm_state = TF_M_ERROR;
+    }
+    uint32_t idx = trustzone_hash_simple((const uint8_t*)&fault_addr, 4)
+                   % (SECURE_STORAGE_SIZE - 16);
+    tz->secure_kv_store[idx] = (uint8_t)(fault_type & 0xFF);
+    tz->secure_kv_store[idx + 1] = (uint8_t)(fault_addr & 0xFF);
+    tz->secure_kv_store[idx + 2] = (uint8_t)((fault_addr >> 8) & 0xFF);
+}
+
+/* L4: PSA Lifecycle state machine transitions
+ * Follows ARM PSA Certified Security Model v2.0 lifecycle states */
+bool trustzone_lifecycle_transition_valid(PSALifecycle from, PSALifecycle to) {
+    if (from == PSA_LIFECYCLE_UNKNOWN) return to == PSA_LIFECYCLE_ASSEMBLY;
+    if (from == PSA_LIFECYCLE_ASSEMBLY)
+        return to == PSA_LIFECYCLE_PROVISIONING || to == PSA_LIFECYCLE_DECOMMISSIONED;
+    if (from == PSA_LIFECYCLE_PROVISIONING)
+        return to == PSA_LIFECYCLE_SECURED || to == PSA_LIFECYCLE_DECOMMISSIONED;
+    if (from == PSA_LIFECYCLE_SECURED)
+        return to == PSA_LIFECYCLE_DECOMMISSIONED;
+    return false;
+}
+
+/* L8: Secure interrupt handling (TrustZone-aware NVIC)
+ * Prioritizes secure interrupts over non-secure ones */
+void trustzone_nvic_set_priority(TrustZoneCore *tz, int irq_num,
+                                  int priority, bool is_secure) {
+    if (is_secure && tz->current_world == SEC_WORLD_NONSECURE) return;
+    if (irq_num < 0 || irq_num >= 256) return;
+    int offset = irq_num % (SECURE_STORAGE_SIZE / 4);
+    tz->secure_kv_store[offset] = (uint8_t)(priority & 0xFF);
+}
+
+/* L6: TF-M Secure Partition Manager: manage isolated partitions */
+bool trustzone_spm_load_partition(TrustZoneCore *tz, int partition_id,
+                                   const uint8_t *image, int img_len) {
+    if (tz->partition_count >= TF_M_PARTITION_MAX) return false;
+    if (img_len <= 0 || img_len > 0x10000) return false;
+    trustzone_isolate_partition(tz, partition_id);
+    for (int i = 0; i < img_len && i < 256; i++)
+        tz->secure_kv_store[(tz->partition_count * 256 + i) % SECURE_STORAGE_SIZE]
+            = image[i];
+    return tz->tfm_state == TF_M_ISOLATED;
+}

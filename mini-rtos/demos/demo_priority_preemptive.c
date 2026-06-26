@@ -2,6 +2,7 @@
 #include "semaphore_mutex.h"
 #include "ipc_queue.h"
 #include "software_timer.h"
+#include "portable.h"
 
 static volatile uint32_t shared_counter = 0;
 static mutex_t *counter_mutex = NULL;

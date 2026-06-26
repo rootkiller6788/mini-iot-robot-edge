@@ -312,3 +312,148 @@ static void timer_daemon(void *param)
         task_delay(1);
     }
 }
+
+/*
+ * L6: Timer chain for sequential delayed operations.
+ *
+ * Chains multiple timer callbacks to execute in sequence with a
+ * fixed delay between each. Useful for multi-stage initialization
+ * or power-up sequencing.
+ *
+ * L5 Algorithm: Linked-list of timers where each callback starts
+ * the next timer in the chain.
+ */
+typedef struct timer_chain_node {
+    sw_timer_t         *timer;
+    struct timer_chain_node *next;
+} timer_chain_node_t;
+
+static timer_chain_node_t *timer_chain_head = NULL;
+
+static void timer_chain_callback(void *param)
+{
+    timer_chain_node_t *node = (timer_chain_node_t *)param;
+    if (!node) return;
+    /* Remove from chain */
+    timer_chain_head = node->next;
+    /* Start next timer if exists */
+    if (node->next && node->next->timer) {
+        timer_start(node->next->timer, 0);
+    }
+    free_rtos(node);
+}
+
+/*
+ * L6: Create and schedule a chain of timers.
+ *
+ * times: array of delay values between each step.
+ * callbacks: array of callback functions (one per step).
+ * params: array of callback parameters.
+ * count: number of steps in the chain.
+ *
+ * Returns 1 on success, 0 on allocation failure.
+ */
+int32_t timer_chain_create(uint32_t *times, timer_callback_t *callbacks,
+                            void **params, uint32_t count)
+{
+    uint32_t i;
+    timer_chain_node_t *prev = NULL, *node;
+
+    if (!times || !callbacks || count == 0) return 0;
+
+    /* Create nodes in reverse order so first node is head */
+    for (i = 0; i < count; i++) {
+        node = (timer_chain_node_t *)malloc_rtos(sizeof(timer_chain_node_t));
+        if (!node) return 0;
+        node->timer = NULL;
+        node->next = prev;
+        prev = node;
+    }
+
+    timer_chain_head = prev;
+
+    /* Create timers for each node */
+    {
+        timer_chain_node_t *curr = timer_chain_head;
+        i = 0;
+        while (curr && i < count) {
+            curr->timer = timer_create("chain_tmr",
+                           (curr->next || i == count - 1) ? callbacks[i] : timer_chain_callback,
+                           curr->next ? curr : params[i],
+                           times[i], TIMER_TYPE_ONE_SHOT);
+            if (!curr->timer) {
+                /* Cleanup on failure */
+                while (timer_chain_head) {
+                    timer_chain_node_t *tmp = timer_chain_head;
+                    timer_chain_head = timer_chain_head->next;
+                    if (tmp->timer) timer_delete(tmp->timer);
+                    free_rtos(tmp);
+                }
+                return 0;
+            }
+            curr = curr->next;
+            i++;
+        }
+    }
+
+    /* Start the first timer */
+    if (timer_chain_head && timer_chain_head->timer) {
+        timer_start(timer_chain_head->timer, 0);
+    }
+
+    return 1;
+}
+
+/*
+ * L3: Timer pool — pre-allocated timer array for fast allocation.
+ *
+ * Avoids heap fragmentation by pre-allocating a fixed pool of timers.
+ * Used in hard-real-time systems where dynamic allocation is forbidden
+ * after initialization.
+ *
+ * L4 Design Principle: Static allocation for WCET determinism (ISO 26262).
+ */
+
+#define TIMER_POOL_SIZE 16
+
+static sw_timer_t  timer_pool_buf[TIMER_POOL_SIZE];
+static uint32_t    timer_pool_free_mask = 0xFFFFU; /* bit=1 means free */
+
+void timer_pool_init(void)
+{
+    memset(timer_pool_buf, 0, sizeof(timer_pool_buf));
+    timer_pool_free_mask = (1U << TIMER_POOL_SIZE) - 1;
+}
+
+/*
+ * L5: Allocate a timer from the static pool (O(1) with ffs).
+ * Returns NULL if pool exhausted.
+ */
+sw_timer_t *timer_pool_alloc(void)
+{
+    uint32_t i;
+    for (i = 0; i < TIMER_POOL_SIZE; i++) {
+        if (timer_pool_free_mask & (1U << i)) {
+            timer_pool_free_mask &= ~(1U << i);
+            memset(&timer_pool_buf[i], 0, sizeof(sw_timer_t));
+            timer_pool_buf[i].id = i + 1000; /* offset pool IDs */
+            return &timer_pool_buf[i];
+        }
+    }
+    return NULL;
+}
+
+/*
+ * L5: Return a timer to the static pool.
+ */
+void timer_pool_free(sw_timer_t *t)
+{
+    if (!t) return;
+    if (t >= timer_pool_buf &&
+        t < timer_pool_buf + TIMER_POOL_SIZE) {
+        uint32_t idx = (uint32_t)(t - timer_pool_buf);
+        timer_pool_free_mask |= (1U << idx);
+        t->active = 0;
+        t->callback = NULL;
+    }
+}

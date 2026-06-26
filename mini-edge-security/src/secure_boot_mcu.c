@@ -225,3 +225,90 @@ uint32_t secure_boot_otp_read(SecureBootCtx *ctx, int fuse_idx) {
            ((uint32_t)ctx->pubkey_hash[(fuse_idx + 2) % PUBKEY_HASH_SIZE] << 16) |
            ((uint32_t)ctx->pubkey_hash[(fuse_idx + 3) % PUBKEY_HASH_SIZE] << 24);
 }
+
+/* L6: Measured Boot - extend hashes into boot state (TPM PCR-like)
+ * Each boot stage measures the next stage before executing it.
+ * This creates an unforgeable log of the boot sequence. */
+void secure_boot_measured_extend(SecureBootCtx *ctx, BootStage stage,
+                                  const uint8_t *measurement, int mlen) {
+    uint8_t combined[BOOT_STATE_SIZE + 64];
+    memcpy(combined, ctx->boot_state, BOOT_STATE_SIZE);
+    int cplen = mlen < 64 ? mlen : 64;
+    memcpy(combined + BOOT_STATE_SIZE, measurement, cplen);
+    boot_hash256(combined, BOOT_STATE_SIZE + cplen, ctx->boot_state);
+    (void)stage;
+}
+
+/* L4: NIST SP 800-193: Platform Firmware Resiliency
+ * Verify boot state integrity against golden measurement */
+bool secure_boot_verify_golden_measurement(SecureBootCtx *ctx,
+                                            const uint8_t *golden_pcr,
+                                            int pcr_len) {
+    int cplen = pcr_len < BOOT_STATE_SIZE ? pcr_len : BOOT_STATE_SIZE;
+    for (int i = 0; i < cplen; i++) {
+        if (ctx->boot_state[i] != golden_pcr[i]) return false;
+    }
+    return true;
+}
+
+/* L5: Secure boot policy enforcement
+ * Implements fail-stop, fail-recover, fail-report, fail-debug policies */
+BootError secure_boot_enforce_policy(SecureBootCtx *ctx, BootError error) {
+    switch (ctx->policy) {
+    case BOOT_POLICY_FAIL_STOP:
+        ctx->secure_boot_enabled = false;
+        ctx->last_error = error;
+        return error;
+    case BOOT_POLICY_FAIL_RECOVER:
+        if (error != BOOT_ERR_ROLLBACK) {
+            ctx->last_error = error;
+        }
+        return BOOT_OK;
+    case BOOT_POLICY_FAIL_REPORT:
+        ctx->last_error = error;
+        return BOOT_OK;
+    case BOOT_POLICY_FAIL_DEBUG:
+        if (ctx->debug_state == DEBUG_UNLOCKED_TEMP ||
+            ctx->debug_state == DEBUG_UNLOCKED_PERM)
+            return BOOT_OK;
+        ctx->last_error = error;
+        return error;
+    }
+    return error;
+}
+
+/* L6: Secure boot certificate chain with root-of-trust verification
+ * Validates: self-signed root -> intermediate CA -> image signing cert */
+bool secure_boot_verify_root_of_trust(SecureBootCtx *ctx,
+                                       const BootCertificate *root_cert) {
+    uint8_t root_digest[32];
+    boot_hash256(root_cert->cert_data, root_cert->cert_len, root_digest);
+    for (int i = 0; i < 16; i++) {
+        if (root_digest[i] != ctx->pubkey_hash[i]) return false;
+    }
+    return true;
+}
+
+/* L4: SoC-specific fuse programming (eFuse/OTP)
+ * Simulates one-time programmable memory that cannot be cleared */
+void secure_boot_program_fuse(SecureBootCtx *ctx, int fuse_idx, uint32_t value) {
+    if (fuse_idx < 0 || fuse_idx >= OTP_FUSE_COUNT) return;
+    secure_boot_otp_write(ctx, fuse_idx, value);
+}
+
+/* L8: Anti-fault injection: verify critical control flow integrity */
+bool secure_boot_check_control_flow(SecureBootCtx *ctx) {
+    uint32_t cf_check = 0;
+    cf_check ^= (uint32_t)(ctx->current_stage);
+    cf_check ^= ((uint32_t)(ctx->debug_state) << 8);
+    cf_check ^= (ctx->secure_boot_enabled ? 0xDEADBEEF : 0);
+    return cf_check != 0;
+}
+
+/* L8: Secure boot with hardware security module (HSM) integration */
+void secure_boot_hsm_init(SecureBootCtx *ctx, const uint8_t *hsm_pubkey, int klen) {
+    int cplen = klen < PUBKEY_HASH_SIZE ? klen : PUBKEY_HASH_SIZE;
+    memcpy(ctx->pubkey_hash, hsm_pubkey, cplen);
+    ctx->secure_boot_enabled = true;
+    ctx->policy = BOOT_POLICY_FAIL_STOP;
+}

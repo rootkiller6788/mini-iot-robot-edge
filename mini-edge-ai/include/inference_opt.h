@@ -36,7 +36,7 @@ typedef enum {
     QUANT_ASYMMETRIC,
     QUANT_SYMMETRIC,
     QUANT_PER_CHANNEL,
-    QUANT_COUNT
+    QUANT_SCHEME_COUNT
 } QuantScheme;
 
 typedef struct {
@@ -122,6 +122,83 @@ ThreadPool*    thread_pool_create(int n);
 void           thread_pool_destroy(ThreadPool* pool);
 int            thread_pool_parallel_for(ThreadPool* pool, void (*fn)(void*, int, int),
                                         void* arg, int start, int end);
+
+/* ── L5: GEMM Micro-Kernel (GotoBLAS 2008 / BLIS framework) ──
+   C[M×N] += A[M×K] × B[K×N]
+   Optimized 6×16 register-blocked kernel with loop unrolling.
+   Simulates register-level tiling for cache efficiency. ── */
+int            gemm_micro_6x16(int M, int N, int K,
+                               const float* A, int lda,
+                               const float* B, int ldb,
+                               float* C, int ldc);
+
+/* ── L5: Cache-Blocked GEMM with Loop Tiling ── */
+int            gemm_blocked(int M, int N, int K,
+                            const float* A, int lda,
+                            const float* B, int ldb,
+                            float* C, int ldc,
+                            int block_m, int block_n, int block_k);
+
+/* ── L5: Depthwise Separable Convolution (Howard et al. 2017) ──
+   MobileNetV1: Splits standard conv into depthwise + pointwise.
+   Reduces computation from D_K²*M*N*D_F² to D_K²*M*D_F² + M*N*D_F². ── */
+int            depthwise_conv2d_3x3(const float* input, int h, int w, int c,
+                                    const float* kernel, const float* bias,
+                                    int stride, float* output);
+int            pointwise_conv2d_1x1(const float* input, int h, int w, int in_c,
+                                     int out_c, const float* kernel,
+                                     const float* bias, float* output);
+
+/* ── L5: Huffman Coding for Weight Compression (Huffman 1952) ──
+   Variable-length prefix coding. Optimal for known symbol frequencies.
+   Used in Deep Compression (Han et al. 2016, ICLR). ── */
+#define HUFFMAN_MAX_SYMBOLS 256
+typedef struct {
+    int      symbol;
+    uint32_t code;
+    int      code_len;
+} HuffmanCode;
+
+typedef struct {
+    HuffmanCode codes[HUFFMAN_MAX_SYMBOLS];
+    int         num_symbols;
+    size_t      total_bits;
+} HuffmanEncoder;
+
+int            huffman_build_tree(const uint32_t* freqs, int n_symbols,
+                                  HuffmanEncoder* enc);
+int            huffman_encode(const HuffmanEncoder* enc, const int* symbols,
+                              int n, uint8_t* bitstream, size_t* bitstream_bytes);
+int            huffman_decode(const HuffmanEncoder* enc, const uint8_t* bitstream,
+                              size_t bitstream_bits, int* symbols, int max_symbols);
+
+/* ── L5: Sparse-Dense Matrix Multiplication (CSR format) ──
+   C[M×N] += A_csr[M×K] × B_dense[K×N]
+   CSR: values[], col_ind[], row_ptr[]
+   Exploits sparsity for speedup proportional to density. ── */
+int            sparse_dense_matmul_csr(const float* values, const int* col_ind,
+                                        const int* row_ptr, int M, int K,
+                                        const float* B, int N,
+                                        float* C);
+
+/* ── L5: Per-Channel Quantization ──
+   Each output channel has its own scale and zero-point.
+   More accurate than per-tensor quantization for convolutions. ── */
+int            per_channel_quantize(const float* src, int n, int channels,
+                                     const float* scales, const int32_t* zps,
+                                     int8_t* dst);
+int            per_channel_dequantize(const int8_t* src, int n, int channels,
+                                       const float* scales, const int32_t* zps,
+                                       float* dst);
+
+/* ── L5: Im2Col + GEMM Convolution (Chellapilla et al. 2006) ──
+   Transforms convolution into matrix multiplication. ── */
+int            im2col(const float* input, int h, int w, int c,
+                      int kh, int kw, int stride, int pad,
+                      float* col);
+int            col2im_gradient(const float* col, int h, int w, int c,
+                               int kh, int kw, int stride, int pad,
+                               float* grad_input);
 
 #ifdef __cplusplus
 }

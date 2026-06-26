@@ -52,6 +52,9 @@ void     heap_dump(void);
 uint32_t heap_get_free_size(void);
 uint32_t heap_get_min_free(void);
 uint32_t heap_calc_largest_free(void);
+uint32_t heap_fragmentation_permil(void);
+uint32_t heap_total_alloc_count(void);
+uint32_t heap_total_free_count(void);
 
 void heap_malloc_failed_hook(void);
 void stack_overflow_init(tcb_t *task);

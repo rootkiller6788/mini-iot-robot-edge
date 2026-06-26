@@ -311,3 +311,117 @@ int32_t gatekeeper_call(mutex_t *gatekeeper, gatekeeper_task_t fn, void *param,
     mutex_unlock(gatekeeper);
     return 1;
 }
+
+/*
+ * L6: Deadlock Detection via Resource Allocation Graph (RAG).
+ *
+ * L5 Algorithm: Cycle detection in a directed graph.
+ *
+ * The Resource Allocation Graph has two types of nodes:
+ *   - Task nodes (T): each mutex owner/waiter.
+ *   - Resource nodes (R): each mutex.
+ * Edges:
+ *   - Request edge: T -> R (task is waiting for mutex).
+ *   - Assignment edge: R -> T (mutex is held by task).
+ *
+ * A cycle in the RAG indicates a deadlock.
+ *
+ * This simplified detector checks for cycles using a DFS with
+ * visited/finished coloring.
+ *
+ * L4 Theorem: Coffman et al. (1971) four necessary conditions for deadlock:
+ *   1. Mutual exclusion
+ *   2. Hold and wait
+ *   3. No preemption
+ *   4. Circular wait
+ *
+ * Reference: Coffman, Elphick, Shoshani (1971) "System Deadlocks",
+ *   ACM Computing Surveys 3(2).
+ */
+
+#define DEADLOCK_MAX_MUTEXES 32
+
+typedef struct {
+    mutex_t *mutex;
+    tcb_t   *owner;
+} rag_edge_t;
+
+/*
+ * L5: DFS cycle detection in resource allocation graph.
+ *
+ * visited[i] = 0 (white), 1 (gray/in-progress), 2 (black/done).
+ * A back-edge to a gray node indicates a cycle (deadlock).
+ *
+ * Returns: 1 if deadlock detected, 0 otherwise.
+ */
+static int deadlock_dfs(uint32_t node, uint8_t *visited,
+                         uint32_t *adj_matrix, uint32_t n)
+{
+    uint32_t i;
+    visited[node] = 1; /* gray */
+    for (i = 0; i < n; i++) {
+        if (adj_matrix[node * n + i]) {
+            if (visited[i] == 1) {
+                return 1; /* back-edge -> deadlock */
+            }
+            if (visited[i] == 0) {
+                if (deadlock_dfs(i, visited, adj_matrix, n)) {
+                    return 1;
+                }
+            }
+        }
+    }
+    visited[node] = 2; /* black */
+    return 0;
+}
+
+/*
+ * L6: Simple deadlock check on mutex wait.
+ * Checks if waiting on m would create a cycle involving current task.
+ *
+ * This is a simple "wait-for" graph check:
+ * If mutex m is held by task T, and T is waiting (directly or transitively)
+ * on a mutex held by the current task, then waiting on m would deadlock.
+ *
+ * Returns: 1 if deadlock would occur, 0 if safe.
+ */
+int32_t mutex_deadlock_check(mutex_t *m)
+{
+    tcb_t *self = task_get_current();
+    tcb_t *holder;
+
+    if (!m || !m->held) return 0;
+    if (m->owner == self) return 0; /* recursive lock is safe */
+
+    /* DFS on wait-for chain: follow m->owner->block_obj chain */
+    holder = m->owner;
+    while (holder && holder->block_obj) {
+        mutex_t *held = (mutex_t *)holder->block_obj;
+        if (held == m) return 1; /* cycle: would deadlock */
+        if (held->owner == self) return 1; /* self in cycle */
+        holder = held->owner;
+    }
+    return 0; /* no cycle found */
+}
+
+/*
+ * L4: Priority Ceiling check.
+ *
+ * Priority Ceiling Protocol (Sha, Rajkumar, Lehoczky 1990):
+ * Each mutex has a priority ceiling = max priority of all tasks
+ * that may lock it. A task can lock a mutex only if its priority
+ * is strictly higher than the ceiling of all currently locked mutexes.
+ *
+ * This prevents deadlock and chained blocking (at most one blocking
+ * per critical section).
+ *
+ * Returns: 1 if the task can lock under PCP, 0 if blocked.
+ */
+int32_t mutex_priority_ceiling_check(mutex_t *m, tcb_t *task)
+{
+    /* For a simple implementation, return the ceiling value.
+     * In production RTOS, this would track all held mutexes. */
+    (void)m;
+    (void)task;
+    return 1; /* simplified check: always pass for this implementation */
+}

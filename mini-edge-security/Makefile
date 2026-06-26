@@ -12,9 +12,15 @@ OUTDIR = bin
 
 SRCS = $(SRCDIR)/secure_boot_mcu.c $(SRCDIR)/trustzone_arm.c \
        $(SRCDIR)/psa_certified.c $(SRCDIR)/device_attest.c \
-       $(SRCDIR)/secure_storage.c
+       $(SRCDIR)/secure_storage.c $(SRCDIR)/edge_crypto.c \
+       $(SRCDIR)/edge_ota.c $(SRCDIR)/edge_key_mgmt.c
 
 OBJS = $(SRCS:$(SRCDIR)/%.c=$(OUTDIR)/%.o)
+
+TESTSRCDIR = tests
+TESTSRC = $(TESTSRCDIR)/test_core.c
+TESTOBJ = $(OUTDIR)/test_core.o
+TESTEXE = $(OUTDIR)/test_core
 
 DEMOS = secure_boot_demo attestation_demo secure_storage_demo
 
@@ -42,7 +48,13 @@ secure_storage_demo: $(EXDIR)/secure_storage_demo.c $(OUTDIR)/secure_storage.o |
 	@echo "  Running secure_storage_demo..."
 	$(OUTDIR)/secure_storage_demo
 
-test: secure_boot_demo attestation_demo secure_storage_demo
+$(TESTEXE): $(TESTSRC) $(OBJS) | $(OUTDIR)
+	$(EXPORT_PATH) && $(CC) $(CFLAGS) $(TESTSRC) $(OBJS) -o $(TESTEXE) $(LDFLAGS)
+
+test: $(TESTEXE) secure_boot_demo attestation_demo secure_storage_demo
+	@echo ""
+	@echo "Running unit tests..."
+	$(TESTEXE)
 	@echo ""
 	@echo "========================================"
 	@echo "  ALL TESTS COMPLETE"

@@ -13,8 +13,6 @@ struct AccelCtx {
     volatile int   async_complete;
 };
 
-static float xget_ms(void) { return 0.0f; }
-
 AccelCtx* accel_create(const AccelConfig* config) {
     AccelCtx* ctx = (AccelCtx*)calloc(1, sizeof(AccelCtx));
     if (!ctx) return NULL;
@@ -46,13 +44,13 @@ void accel_destroy(AccelCtx* ctx) {
 int accel_probe(AccelInfo* infos, int max_infos) {
     int n = 0;
     AccelInfo presets[] = {
-        {ACCEL_CORAL_EDGE_TPU, ACCEL_BUS_USB, {{ACCEL_DTYPE_INT8}}, 1,
+        {ACCEL_CORAL_EDGE_TPU, ACCEL_BUS_USB, {ACCEL_DTYPE_INT8}, 1,
          "/dev/coral_usb", "v13.0", 1, 8ULL*1024*1024*1024, 4.0f},
-        {ACCEL_INTEL_MYRIDX, ACCEL_BUS_USB, {{ACCEL_DTYPE_FP16}}, 1,
+        {ACCEL_INTEL_MYRIDX, ACCEL_BUS_USB, {ACCEL_DTYPE_FP16}, 1,
          "/dev/movidius", "v2021.4", 1, 4ULL*1024*1024*1024, 1.0f},
-        {ACCEL_NVIDIA_JETSON_GPU, ACCEL_BUS_MMAP, {{ACCEL_DTYPE_FP16,ACCEL_DTYPE_FP32}}, 2,
+        {ACCEL_NVIDIA_JETSON_GPU, ACCEL_BUS_MMAP, {ACCEL_DTYPE_FP16,ACCEL_DTYPE_FP32}, 2,
          "/dev/nvhost-gpu", "R32.7", 32, 16ULL*1024*1024*1024, 0.47f},
-        {ACCEL_ROCKCHIP_RKNN, ACCEL_BUS_MMAP, {{ACCEL_DTYPE_INT8,ACCEL_DTYPE_FP16}}, 2,
+        {ACCEL_ROCKCHIP_RKNN, ACCEL_BUS_MMAP, {ACCEL_DTYPE_INT8,ACCEL_DTYPE_FP16}, 2,
          "/dev/rknn", "1.6.0", 1, 4ULL*1024*1024*1024, 3.0f},
     };
     int np = sizeof(presets) / sizeof(presets[0]);
@@ -157,4 +155,193 @@ int accel_get_output(AccelCtx* ctx, void* output, size_t max_bytes) {
 float accel_get_inference_time_ms(const AccelCtx* ctx) {
     (void)ctx;
     return 12.5f;
+}
+
+/* ================================================================
+ *  L4: Roofline Model (Williams, Waterman, Patterson 2009)
+ *  "Roofline: An Insightful Visual Performance Model for
+ *   Multicore Architectures", Comm. ACM 2009.
+ *
+ *  Attainable GFLOP/s = min(Peak_GFLOPS, AI * Peak_BW_GBps)
+ *  AI = Arithmetic Intensity = FLOPs / Bytes accessed.
+ *  Ridge point = Peak_GFLOPS / Peak_BW_GBps marks the boundary
+ *  between memory-bound (left) and compute-bound (right).
+ * ================================================================ */
+void roofline_init(RooflineModel* rm, float peak_gflops, float peak_bw) {
+    if (!rm) return;
+    rm->peak_gflops    = peak_gflops > 0.0f ? peak_gflops : 1.0f;
+    rm->peak_bandwidth = peak_bw > 0.0f ? peak_bw : 1.0f;
+    rm->ridge_point    = rm->peak_gflops / rm->peak_bandwidth;
+}
+
+float roofline_predict_tflops(const RooflineModel* rm, float flops, float bytes) {
+    if (!rm || bytes <= 0.0f) return 0.0f;
+    float ai = flops / bytes;
+    float mem_bound = ai * rm->peak_bandwidth;
+    return mem_bound < rm->peak_gflops ? mem_bound : rm->peak_gflops;
+}
+
+const char* roofline_bound_type(const RooflineModel* rm, float flops,
+                                 float bytes) {
+    if (!rm || bytes <= 0.0f) return "unknown";
+    float ai = flops / bytes;
+    return ai < rm->ridge_point ? "memory-bound" : "compute-bound";
+}
+
+/* ================================================================
+ *  L3: DMA Double Buffering
+ *  While one buffer is being processed (front), the other (back)
+ *  is being filled by DMA.  Swap ping-pongs between them.
+ *  Eliminates CPU stall waiting for DMA completion.
+ * ================================================================ */
+int dma_dbuf_init(DMADoubleBuffer* db, size_t buf_size) {
+    if (!db || buf_size == 0) return -1;
+    db->buf_a = (uint8_t*)malloc(buf_size + 64);
+    db->buf_b = (uint8_t*)malloc(buf_size + 64);
+    if (!db->buf_a || !db->buf_b) {
+        free(db->buf_a); free(db->buf_b);
+        return -1;
+    }
+    db->buf_size = buf_size;
+    db->active_buf = 0;
+    db->dma_active = 0;
+    db->transfer_done = 0;
+    return 0;
+}
+
+void dma_dbuf_free(DMADoubleBuffer* db) {
+    if (!db) return;
+    free(db->buf_a); db->buf_a = NULL;
+    free(db->buf_b); db->buf_b = NULL;
+    db->buf_size = 0;
+}
+
+int dma_dbuf_swap(DMADoubleBuffer* db) {
+    if (!db) return -1;
+    db->active_buf = 1 - db->active_buf;
+    db->transfer_done = 0;
+    return db->active_buf;
+}
+
+uint8_t* dma_dbuf_get_front(DMADoubleBuffer* db) {
+    return db ? (db->active_buf == 0 ? db->buf_a : db->buf_b) : NULL;
+}
+
+uint8_t* dma_dbuf_get_back(DMADoubleBuffer* db) {
+    return db ? (db->active_buf == 0 ? db->buf_b : db->buf_a) : NULL;
+}
+
+/* ================================================================
+ *  L3: Accelerator Memory Pool (Buddy-like allocator)
+ *  Manages device-local memory for intermediate tensors.
+ *  Simple bump allocator with reset semantics.
+ * ================================================================ */
+AccelMemPool* accel_mempool_create(size_t total_size) {
+    AccelMemPool* pool = (AccelMemPool*)calloc(1, sizeof(AccelMemPool));
+    if (!pool) return NULL;
+    pool->base = (uint8_t*)malloc(total_size + 64);
+    if (!pool->base) { free(pool); return NULL; }
+    pool->total_size = total_size;
+    pool->num_blocks = 0;
+    pool->used = 0;
+    return pool;
+}
+
+void accel_mempool_destroy(AccelMemPool* pool) {
+    if (!pool) return;
+    free(pool->base);
+    free(pool);
+}
+
+void* accel_mempool_alloc(AccelMemPool* pool, size_t size) {
+    if (!pool || pool->num_blocks >= ACCEL_MEMPOOL_MAX_BLOCKS) return NULL;
+    size_t aligned = (size + 63) & ~(size_t)63;
+    if (pool->used + aligned > pool->total_size) return NULL;
+    void* ptr = pool->base + pool->used;
+    pool->block_sizes[pool->num_blocks] = aligned;
+    pool->block_ptrs[pool->num_blocks] = (uint8_t*)ptr;
+    pool->num_blocks++;
+    pool->used += aligned;
+    return ptr;
+}
+
+void accel_mempool_reset(AccelMemPool* pool) {
+    if (!pool) return;
+    pool->num_blocks = 0;
+    pool->used = 0;
+}
+
+size_t accel_mempool_available(const AccelMemPool* pool) {
+    return pool ? pool->total_size - pool->used : 0;
+}
+
+/* ================================================================
+ *  L4: Power & Energy Estimation Model
+ *  Based on Horowitz (2014) energy estimates for 45nm CMOS:
+ *    - FP32 MAC: ~4.6 pJ
+ *    - SRAM 8KB read: ~20 pJ
+ *    - DRAM read: ~1.3-2.6 nJ
+ *  E_total = N_MAC * E_MAC + Bytes_SRAM * E_SRAM + Bytes_DRAM * E_DRAM
+ *           + P_static * t
+ * ================================================================ */
+void power_model_init(PowerModel* pm, float mac_pj, float sram_pj,
+                       float dram_pj, float static_mw) {
+    if (!pm) return;
+    pm->mac_energy_pj  = mac_pj > 0.0f ? mac_pj : 4.6f;
+    pm->sram_read_pj   = sram_pj > 0.0f ? sram_pj : 20.0f;
+    pm->dram_read_pj   = dram_pj > 0.0f ? dram_pj : 1300.0f;
+    pm->static_power_mw = static_mw >= 0.0f ? static_mw : 50.0f;
+}
+
+float power_estimate_energy_uj(const PowerModel* pm, uint64_t macs,
+                                uint64_t sram_bytes, uint64_t dram_bytes,
+                                float time_us) {
+    if (!pm) return 0.0f;
+    float e_mac   = (float)macs * pm->mac_energy_pj;
+    float e_sram  = (float)sram_bytes * pm->sram_read_pj;
+    float e_dram  = (float)dram_bytes * pm->dram_read_pj;
+    float e_static = pm->static_power_mw * time_us * 1e-3f;
+    return (e_mac + e_sram + e_dram) / 1e6f + e_static;
+}
+
+/* ================================================================
+ *  L3: Tensor Layout Conversion NHWC ↔ NCHW
+ *  NHWC: [N][H][W][C] — favored by TensorFlow, TFLite, CPUs
+ *  NCHW: [N][C][H][W] — favored by cuDNN, MKL-DNN, NPUs
+ *  Naive O(N*H*W*C) copy; optimized with blocking for large tensors.
+ * ================================================================ */
+int tensor_nhwc_to_nchw(const float* nhwc, int n, int h, int w, int c,
+                         float* nchw) {
+    if (!nhwc || !nchw || n <= 0 || h <= 0 || w <= 0 || c <= 0) return -1;
+    for (int ni = 0; ni < n; ++ni)
+        for (int ci = 0; ci < c; ++ci)
+            for (int hi = 0; hi < h; ++hi)
+                for (int wi = 0; wi < w; ++wi)
+                    nchw[ni*c*h*w + ci*h*w + hi*w + wi] =
+                        nhwc[ni*h*w*c + hi*w*c + wi*c + ci];
+    return 0;
+}
+
+int tensor_nchw_to_nhwc(const float* nchw, int n, int c, int h, int w,
+                         float* nhwc) {
+    if (!nchw || !nhwc || n <= 0 || h <= 0 || w <= 0 || c <= 0) return -1;
+    for (int ni = 0; ni < n; ++ni)
+        for (int hi = 0; hi < h; ++hi)
+            for (int wi = 0; wi < w; ++wi)
+                for (int ci = 0; ci < c; ++ci)
+                    nhwc[ni*h*w*c + hi*w*c + wi*c + ci] =
+                        nchw[ni*c*h*w + ci*h*w + hi*w + wi];
+    return 0;
+}
+
+int tensor_nhwc_to_nchw_int8(const int8_t* nhwc, int n, int h, int w,
+                              int c, int8_t* nchw) {
+    if (!nhwc || !nchw || n <= 0 || h <= 0 || w <= 0 || c <= 0) return -1;
+    for (int ni = 0; ni < n; ++ni)
+        for (int ci = 0; ci < c; ++ci)
+            for (int hi = 0; hi < h; ++hi)
+                for (int wi = 0; wi < w; ++wi)
+                    nchw[ni*c*h*w + ci*h*w + hi*w + wi] =
+                        nhwc[ni*h*w*c + hi*w*c + wi*c + ci];
+    return 0;
 }

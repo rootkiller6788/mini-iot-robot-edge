@@ -128,10 +128,10 @@ void device_attest_challenge(DeviceAttestCtx *ctx, const uint8_t *challenge, int
 
 bool device_attest_verify_cloud(DeviceAttestCtx *ctx, const uint8_t *response) {
     uint8_t expected_signature[DEVICE_KEY_SIZE];
-    attend_hmac(ctx->identity.device_key, DEVICE_KEY_SIZE, ctx->nonce, CHALLENGE_SIZE,
+    attest_hmac(ctx->identity.device_key, DEVICE_KEY_SIZE, ctx->nonce, CHALLENGE_SIZE,
                  expected_signature);
     for (int i = 0; i < DEVICE_KEY_SIZE; i++) {
-        if (expected_signature[i] ^ (uint8_t)(i * 0x11) != response[i]) return false;
+        if ((expected_signature[i] ^ (uint8_t)(i * 0x11)) != response[i]) return false;
     }
     ctx->state = ATTEST_VERIFIED;
     return true;
@@ -200,4 +200,99 @@ void device_attest_derive_session_key(DeviceAttestCtx *ctx,
                                        uint8_t session_key[DEVICE_KEY_SIZE]) {
     attest_hmac(ctx->identity.device_key, DEVICE_KEY_SIZE,
                  ctx->nonce, CHALLENGE_SIZE, session_key);
+}
+
+/* L4: DICE (Device Identifier Composition Engine) attestation
+ * TCG DICE Architecture: Compound Device Identifier (CDI) layered derivation
+ * L0 (UDS) -> L1 (CDI) -> L2+ (Alias Keys) */
+void device_attest_dice_derive_cdi(DeviceAttestCtx *ctx,
+                                    const uint8_t *fw_digest, int digest_len,
+                                    uint8_t cdi[DEVICE_KEY_SIZE]) {
+    uint8_t combined[DEVICE_ID_SIZE + FIRMWARE_HASH_SIZE];
+    memcpy(combined, ctx->identity.device_id, DEVICE_ID_SIZE);
+    int cplen = digest_len < FIRMWARE_HASH_SIZE ? digest_len : FIRMWARE_HASH_SIZE;
+    memcpy(combined + DEVICE_ID_SIZE, fw_digest, cplen);
+    attest_hash256(combined, DEVICE_ID_SIZE + cplen, cdi);
+}
+
+/* L4: DICE alias key derivation from CDI
+ * Derives layer-specific attestation keys without exposing UDS */
+void device_attest_dice_alias_key(DeviceAttestCtx *ctx,
+                                   const uint8_t *cdi, int cdi_len,
+                                   const uint8_t *layer_label, int label_len,
+                                   uint8_t alias_key[DEVICE_KEY_SIZE]) {
+    uint8_t input[DEVICE_KEY_SIZE + 32];
+    memcpy(input, cdi, cdi_len < DEVICE_KEY_SIZE ? cdi_len : DEVICE_KEY_SIZE);
+    int ll = label_len < 32 ? label_len : 32;
+    memcpy(input + DEVICE_KEY_SIZE, layer_label, ll);
+    attest_hmac(ctx->identity.device_key, DEVICE_KEY_SIZE,
+                 input, DEVICE_KEY_SIZE + ll, alias_key);
+}
+
+/* L4: IETF RATS (Remote ATtestation ProcedureS) evidence collection
+ * RFC 9334: Collects claims about device state for attester-verifier model */
+bool device_attest_collect_evidence(DeviceAttestCtx *ctx,
+                                     uint8_t *evidence, int *ev_len,
+                                     int max_ev_len) {
+    if (max_ev_len < 128) { *ev_len = 0; return false; }
+    *ev_len = 0;
+    evidence[(*ev_len)++] = (uint8_t)(ctx->fw_version & 0xFF);
+    evidence[(*ev_len)++] = (uint8_t)((ctx->fw_version >> 8) & 0xFF);
+    evidence[(*ev_len)++] = ctx->secure_boot_ok ? 1 : 0;
+    memcpy(evidence + *ev_len, ctx->fw_hash, FIRMWARE_HASH_SIZE);
+    *ev_len += FIRMWARE_HASH_SIZE;
+    memcpy(evidence + *ev_len, ctx->boot_state, BOOT_STATE_SIZE);
+    *ev_len += BOOT_STATE_SIZE;
+    evidence[(*ev_len)++] = (uint8_t)(ctx->identity.key_source);
+    return true;
+}
+
+/* L7: Azure DPS symmetric key attestation
+ * Device Provisioning Service with derived symmetric key from registration ID */
+void device_attest_azure_symmetric_key(DeviceAttestCtx *ctx,
+                                        const char *registration_id,
+                                        uint8_t derived_key[DEVICE_KEY_SIZE]) {
+    int rid_len = (int)strlen(registration_id);
+    uint8_t input[AZURE_REG_ID_MAX + DEVICE_KEY_SIZE];
+    memcpy(input, registration_id, rid_len < AZURE_REG_ID_MAX ? rid_len : AZURE_REG_ID_MAX);
+    memcpy(input + rid_len, ctx->identity.device_key, DEVICE_KEY_SIZE);
+    attest_hash256(input, rid_len + DEVICE_KEY_SIZE, derived_key);
+    ctx->protocol = PROTOCOL_AZURE_DPS;
+}
+
+/* L7: AWS IoT Multi-Account Registration (fleet provisioning)
+ * Supports claim certificate-based fleet provisioning template */
+void device_attest_aws_fleet_provisioning(DeviceAttestCtx *ctx,
+                                           const char *template_name,
+                                           uint8_t *claim_cert, int cert_len) {
+    ctx->protocol = PROTOCOL_AWS_IOT;
+    int tn_len = (int)strlen(template_name);
+    memcpy(ctx->identity.factory_cert, claim_cert,
+           cert_len < X509_CERT_SIZE ? cert_len : X509_CERT_SIZE);
+    ctx->identity.factory_cert_len = cert_len < X509_CERT_SIZE
+                                      ? cert_len : X509_CERT_SIZE;
+    (void)tn_len;
+}
+
+/* L6: TPM 2.0 PCR (Platform Configuration Register) extensions
+ * Extends PCR[0..N] using hash chaining: PCR_new = H(PCR_old || digest) */
+void device_attest_tpm_pcr_extend(DeviceAttestCtx *ctx, int pcr_index,
+                                   const uint8_t *digest, int digest_len) {
+    uint8_t combined[BOOT_STATE_SIZE + FIRMWARE_HASH_SIZE];
+    memcpy(combined, ctx->boot_state, BOOT_STATE_SIZE);
+    int cplen = digest_len < FIRMWARE_HASH_SIZE ? digest_len : FIRMWARE_HASH_SIZE;
+    memcpy(combined + BOOT_STATE_SIZE, digest, cplen);
+    attest_hash256(combined, BOOT_STATE_SIZE + cplen, ctx->boot_state);
+    ctx->boot_state[0] ^= (uint8_t)(pcr_index & 0xFF);
+}
+
+/* L8: Anti-replay protection: monotonically increasing attestation nonce */
+bool device_attest_check_nonce_freshness(DeviceAttestCtx *ctx,
+                                          const uint8_t *nonce, int nonce_len) {
+    uint64_t new_nonce = 0, stored_nonce = 0;
+    for (int i = 0; i < nonce_len && i < 8; i++)
+        new_nonce = (new_nonce << 8) | nonce[i];
+    for (int i = 0; i < CHALLENGE_SIZE && i < 8; i++)
+        stored_nonce = (stored_nonce << 8) | ctx->nonce[i];
+    return new_nonce > stored_nonce;
 }
